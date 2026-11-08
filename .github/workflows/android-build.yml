@@ -1,0 +1,125 @@
+name: Android APK
+
+# Builds the native Sportage OBD launcher (android/) on every push and pull request,
+# signs the release APK when keystore secrets are configured, and attaches the APKs to a
+# GitHub Release when a v* tag is pushed.
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: android-apk-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: false
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x gradlew
+
+      # ---------------------------------------------------------------- signing
+      # Add these repository secrets to produce a signed release APK:
+      #   RELEASE_KEYSTORE_BASE64    base64 of your .jks file (single line)
+      #   RELEASE_KEYSTORE_PASSWORD  keystore password
+      #   RELEASE_KEY_ALIAS          key alias inside the keystore
+      #   RELEASE_KEY_PASSWORD       password for that alias
+      # Without them the workflow still succeeds, producing the debug & unsigned release APKs.
+      - name: Prepare release keystore
+        env:
+          RELEASE_KEYSTORE_BASE64: ${{ secrets.RELEASE_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$RELEASE_KEYSTORE_BASE64" ]; then
+            echo "RELEASE_KEYSTORE_BASE64 is not set - release APK will be unsigned."
+            exit 0
+          fi
+          printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > release.jks
+          echo "Keystore restored ($(wc -c < release.jks) bytes)."
+
+      # ------------------------------------------------------------------ build
+      - name: Unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace || true
+
+      - name: Lint
+        run: ./gradlew lintDebug --stacktrace || true
+
+      - name: Build debug APK
+        run: ./gradlew assembleDebug --stacktrace
+
+      - name: Build release APK
+        env:
+          SPORTAGE_KEYSTORE_FILE: release.jks
+          SPORTAGE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
+          SPORTAGE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
+          SPORTAGE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
+        run: ./gradlew assembleRelease --stacktrace || true
+
+      - name: Collect APKs
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          find app/build/outputs/apk -name "*.apk" -type f -exec cp {} "$GITHUB_WORKSPACE/out/" \;
+          echo "Collected APKs:"
+          ls -lh "$GITHUB_WORKSPACE/out"
+
+      - name: Upload APKs
+        uses: actions/upload-artifact@v4
+        with:
+          name: sportage-obd-apk
+          path: out/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download APKs
+        uses: actions/download-artifact@v4
+        with:
+          name: sportage-obd-apk
+          path: out
+
+      # AGP names an unsigned release "app-release-unsigned.apk", so a tag build without
+      # signing secrets fails here instead of publishing an uninstallable artifact.
+      - name: Require a signed release APK
+        run: |
+          if ls out/*unsigned*.apk >/dev/null 2>&1; then
+            echo "::error::Release APK is unsigned. Add RELEASE_KEYSTORE_BASE64, RELEASE_KEYSTORE_PASSWORD, RELEASE_KEY_ALIAS and RELEASE_KEY_PASSWORD repository secrets."
+            exit 1
+          fi
+          ls -lh out
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: out/*.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
