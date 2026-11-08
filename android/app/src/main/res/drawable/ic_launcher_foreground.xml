@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Outer Glow Ring -->
+    <path
+        android:strokeColor="#00E5FF"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:pathData="M34,68 A26,26 0 1,1 74,68" />
+    
+    <!-- Accent Speed Arc -->
+    <path
+        android:strokeColor="#FF9100"
+        android:strokeWidth="3.5"
+        android:strokeLineCap="round"
+        android:pathData="M66,36 A26,26 0 0,1 74,68" />
+
+    <!-- Center Speedometer Needle -->
+    <path
+        android:fillColor="#00E5FF"
+        android:pathData="M54,52 L57,32 L54,28 L51,32 Z" />
+    
+    <!-- Center Pivot Dot -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,54m-4,0a4,4 0 1,1 8,0a4,4 0 1,1 -8,0" />
+
+    <!-- Car Silhouette Base -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M42,76 L44,70 L64,70 L66,76 L68,76 C69,76 70,77 70,78 L70,82 C70,83 69,84 68,84 L67,84 L67,86 C67,87 66,88 65,88 L63,88 C62,88 61,87 61,86 L61,84 L47,84 L47,86 C47,87 46,88 45,88 L43,88 C42,88 41,87 41,86 L41,84 L40,84 C39,84 38,83 38,82 L38,78 C38,77 39,76 40,76 Z" />
+</vector>

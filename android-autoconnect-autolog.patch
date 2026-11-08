@@ -1,0 +1,420 @@
+diff --git a/android/app/src/main/AndroidManifest.xml b/android/app/src/main/AndroidManifest.xml
+index 285a917..21a7a9d 100644
+--- a/android/app/src/main/AndroidManifest.xml
++++ b/android/app/src/main/AndroidManifest.xml
+@@ -26,6 +26,8 @@
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
++    <!-- Auto-start OBD connection when car or head unit powers on -->
++    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+ 
+     <!-- QUERY_ALL_PACKAGES: only so the launcher app drawer can list installed apps.
+          Not used for advertising, profiling, or any purpose other than the launcher UI. -->
+@@ -66,6 +68,18 @@
+             android:foregroundServiceType="connectedDevice"
+             android:exported="false" />
+ 
++        <!-- Auto-Connect Broadcast Receiver: car ignition, power plug, bluetooth link -->
++        <receiver
++            android:name=".service.IgnitionReceiver"
++            android:exported="true">
++            <intent-filter>
++                <action android:name="android.intent.action.BOOT_COMPLETED" />
++                <action android:name="android.intent.action.ACTION_POWER_CONNECTED" />
++                <action android:name="android.bluetooth.device.action.ACL_CONNECTED" />
++                <action android:name="android.bluetooth.adapter.action.STATE_CHANGED" />
++            </intent-filter>
++        </receiver>
++
+         <!-- Shares CSV telemetry logs with email / Drive / messaging apps -->
+         <provider
+             android:name="androidx.core.content.FileProvider"
+diff --git a/android/app/src/main/java/com/sportage/obd/MainActivity.kt b/android/app/src/main/java/com/sportage/obd/MainActivity.kt
+index 8b14cde..e3903a2 100644
+--- a/android/app/src/main/java/com/sportage/obd/MainActivity.kt
++++ b/android/app/src/main/java/com/sportage/obd/MainActivity.kt
+@@ -166,6 +166,9 @@ class MainActivity : ComponentActivity(), LocationListener {
+         val btGranted = btEntries.all { it.value }
+         if (btGranted) {
+             refreshPairedDevices()
++            if (viewModel.isAutoConnectEnabled()) {
++                viewModel.startAndBindService()
++            }
+         } else if (btEntries.isNotEmpty()) {
+             // Silence here looked like "no adapters found"; tell the driver what actually happened.
+             Toast.makeText(
+@@ -912,6 +915,9 @@ class MainActivity : ComponentActivity(), LocationListener {
+         if (missing.isEmpty()) {
+             refreshPairedDevices()
+             initLocationTracking()
++            if (viewModel.isAutoConnectEnabled()) {
++                viewModel.startAndBindService()
++            }
+         } else {
+             permissionLauncher.launch(missing.toTypedArray())
+         }
+diff --git a/android/app/src/main/java/com/sportage/obd/repository/ObdRepository.kt b/android/app/src/main/java/com/sportage/obd/repository/ObdRepository.kt
+index 5a34ab1..a233da6 100644
+--- a/android/app/src/main/java/com/sportage/obd/repository/ObdRepository.kt
++++ b/android/app/src/main/java/com/sportage/obd/repository/ObdRepository.kt
+@@ -275,6 +275,8 @@ class ObdRepository(private val context: Context) {
+         // the relaunched UI shows live telemetry instead of a disconnected cockpit.
+         if (ObdService.isRunning) {
+             bindService()
++        } else if (hasRememberedAdapter() && isAutoConnectEnabled()) {
++            startAndBindService()
+         }
+     }
+ 
+@@ -662,9 +664,30 @@ class ObdRepository(private val context: Context) {
+         obdService?.stopCsvLogging()
+     }
+ 
+-    fun csvAutostart(): Boolean = obdService?.csvAutostart() ?: false
++    fun hasRememberedAdapter(): Boolean {
++        val prefs = context.getSharedPreferences("sportage_obd_service", Context.MODE_PRIVATE)
++        return !prefs.getString("last_adapter_address", null).isNullOrBlank()
++    }
++
++    fun isAutoConnectEnabled(): Boolean {
++        val prefs = context.getSharedPreferences("sportage_obd_service", Context.MODE_PRIVATE)
++        return prefs.getBoolean("bluetooth_autoconnect", true)
++    }
++
++    fun setAutoConnectEnabled(enabled: Boolean) {
++        val prefs = context.getSharedPreferences("sportage_obd_service", Context.MODE_PRIVATE)
++        prefs.edit().putBoolean("bluetooth_autoconnect", enabled).apply()
++        obdService?.setAutoConnectEnabled(enabled)
++    }
++
++    fun csvAutostart(): Boolean {
++        val prefs = context.getSharedPreferences("sportage_obd_service", Context.MODE_PRIVATE)
++        return obdService?.csvAutostart() ?: prefs.getBoolean("csv_autostart", true)
++    }
+ 
+     fun setCsvAutostart(enabled: Boolean) {
++        val prefs = context.getSharedPreferences("sportage_obd_service", Context.MODE_PRIVATE)
++        prefs.edit().putBoolean("csv_autostart", enabled).apply()
+         obdService?.setCsvAutostart(enabled)
+     }
+ 
+diff --git a/android/app/src/main/java/com/sportage/obd/service/IgnitionReceiver.kt b/android/app/src/main/java/com/sportage/obd/service/IgnitionReceiver.kt
+new file mode 100644
+index 0000000..70fd9c5
+--- /dev/null
++++ b/android/app/src/main/java/com/sportage/obd/service/IgnitionReceiver.kt
+@@ -0,0 +1,93 @@
++package com.sportage.obd.service
++
++import android.bluetooth.BluetoothAdapter
++import android.bluetooth.BluetoothDevice
++import android.content.BroadcastReceiver
++import android.content.Context
++import android.content.Intent
++import android.os.Build
++import android.util.Log
++import androidx.core.content.ContextCompat
++
++/**
++ * Ignition & Bluetooth Event Receiver
++ *
++ * Automatically triggers ObdService reconnection and live data stream logging when:
++ * 1. Car ignition powers on (device receives 12V charger power via ACTION_POWER_CONNECTED)
++ * 2. Car OBD-II ELM327 Bluetooth dongle establishes ACL link (ACTION_ACL_CONNECTED)
++ * 3. Bluetooth is toggled ON (BluetoothAdapter.ACTION_STATE_CHANGED)
++ * 4. Android system finishes booting (BOOT_COMPLETED)
++ */
++class IgnitionReceiver : BroadcastReceiver() {
++
++    companion object {
++        private const val TAG = "IgnitionReceiver"
++        private const val PREFS_NAME = "sportage_obd_service"
++        private const val KEY_LAST_DEVICE = "last_adapter_address"
++        private const val KEY_AUTOCONNECT = "bluetooth_autoconnect"
++    }
++
++    override fun onReceive(context: Context, intent: Intent?) {
++        val action = intent?.action ?: return
++        Log.d(TAG, "Received ignition/bluetooth trigger broadcast: $action")
++
++        val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
++        val isAutoConnectEnabled = prefs.getBoolean(KEY_AUTOCONNECT, true)
++        if (!isAutoConnectEnabled) {
++            Log.d(TAG, "Auto-connect is disabled in settings. Skipping trigger.")
++            return
++        }
++
++        val rememberedAddress = prefs.getString(KEY_LAST_DEVICE, null)
++        if (rememberedAddress.isNullOrBlank()) {
++            Log.d(TAG, "No previously paired OBD adapter remembered. Skipping auto-connect.")
++            return
++        }
++
++        when (action) {
++            BluetoothDevice.ACTION_ACL_CONNECTED -> {
++                val device: BluetoothDevice? = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
++                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
++                } else {
++                    @Suppress("DEPRECATION")
++                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
++                }
++
++                // If the connected Bluetooth device is our target ELM327 adapter
++                if (device != null && device.address.equals(rememberedAddress, ignoreCase = true)) {
++                    Log.i(TAG, "Car ELM327 Bluetooth ACL link detected (${device.address})! Auto-connecting...")
++                    triggerServiceConnect(context)
++                }
++            }
++
++            Intent.ACTION_POWER_CONNECTED -> {
++                Log.i(TAG, "Car ignition 12V power detected (ACTION_POWER_CONNECTED)! Auto-connecting to OBD...")
++                triggerServiceConnect(context)
++            }
++
++            BluetoothAdapter.ACTION_STATE_CHANGED -> {
++                val state = intent.getIntExtra(BluetoothAdapter.EXTRA_STATE, BluetoothAdapter.ERROR)
++                if (state == BluetoothAdapter.STATE_ON) {
++                    Log.i(TAG, "Bluetooth switched to STATE_ON. Initiating OBD auto-connect...")
++                    triggerServiceConnect(context)
++                }
++            }
++
++            Intent.ACTION_BOOT_COMPLETED -> {
++                Log.i(TAG, "Device boot completed. Waking OBD service in auto-connect standby...")
++                triggerServiceConnect(context)
++            }
++        }
++    }
++
++    private fun triggerServiceConnect(context: Context) {
++        try {
++            val serviceIntent = Intent(context, ObdService::class.java).apply {
++                action = ObdService.ACTION_AUTO_CONNECT
++            }
++            ContextCompat.startForegroundService(context, serviceIntent)
++        } catch (e: Exception) {
++            Log.e(TAG, "Failed to start ObdService on ignition trigger", e)
++        }
++    }
++}
+diff --git a/android/app/src/main/java/com/sportage/obd/service/ObdService.kt b/android/app/src/main/java/com/sportage/obd/service/ObdService.kt
+index 2eb282f..4af1ac2 100644
+--- a/android/app/src/main/java/com/sportage/obd/service/ObdService.kt
++++ b/android/app/src/main/java/com/sportage/obd/service/ObdService.kt
+@@ -111,11 +111,13 @@ class ObdService : Service() {
+         const val ACTION_STOP = "com.sportage.obd.action.STOP_SERVICE"
+         const val ACTION_PAUSE_POLLING = "com.sportage.obd.action.PAUSE_POLLING"
+         const val ACTION_RESUME_POLLING = "com.sportage.obd.action.RESUME_POLLING"
++        const val ACTION_AUTO_CONNECT = "com.sportage.obd.action.AUTO_CONNECT"
+ 
+-        private const val PREFS_NAME = "sportage_obd_service"
+-        private const val KEY_LAST_DEVICE = "last_adapter_address"
+-        private const val KEY_LAST_DEVICE_IS_BLE = "last_adapter_is_ble"
+-        private const val KEY_CSV_AUTOSTART = "csv_autostart"
++        const val PREFS_NAME = "sportage_obd_service"
++        const val KEY_LAST_DEVICE = "last_adapter_address"
++        const val KEY_LAST_DEVICE_IS_BLE = "last_adapter_is_ble"
++        const val KEY_CSV_AUTOSTART = "csv_autostart"
++        const val KEY_AUTOCONNECT = "bluetooth_autoconnect"
+         /** Field separator for the persisted Mode 09 identity blob. */
+         internal const val FIELD_SEPARATOR = "\u001F"
+ 
+@@ -146,6 +148,7 @@ class ObdService : Service() {
+ 
+     // Target Bluetooth device to maintain connection with
+     private var activeDevice: BluetoothDevice? = null
++    private var dynamicIgnitionReceiver: android.content.BroadcastReceiver? = null
+ 
+     // Telemetry and connection state
+     private val _telemetry = MutableStateFlow(ObdTelemetry())
+@@ -256,6 +259,24 @@ class ObdService : Service() {
+             // touches android.net.Uri). The service still works without being foregrounded.
+             android.util.Log.e("ObdService", "startForeground failed - continuing anyway", e)
+         }
++        try {
++            val filter = android.content.IntentFilter().apply {
++                addAction(BluetoothDevice.ACTION_ACL_CONNECTED)
++                addAction(BluetoothAdapter.ACTION_STATE_CHANGED)
++                addAction(Intent.ACTION_POWER_CONNECTED)
++            }
++            dynamicIgnitionReceiver = object : android.content.BroadcastReceiver() {
++                override fun onReceive(context: Context?, intent: Intent?) {
++                    if (isAutoConnectEnabled() && connectionState.value !is ConnectionState.Connected && activeDevice == null) {
++                        android.util.Log.i("ObdService", "Ignition / Bluetooth event received in active service. Auto-connecting...")
++                        restoreLastDevice()
++                    }
++                }
++            }
++            registerReceiver(dynamicIgnitionReceiver, filter)
++        } catch (e: Exception) {
++            android.util.Log.e("ObdService", "Failed to register dynamic ignition receiver", e)
++        }
+         isRunning = true
+     }
+ 
+@@ -282,6 +303,15 @@ class ObdService : Service() {
+                 }
+                 ACTION_START -> {
+                     updateNotification("Ready for Bluetooth link")
++                    if (isAutoConnectEnabled()) {
++                        restoreLastDevice()
++                    }
++                }
++                ACTION_AUTO_CONNECT -> {
++                    if (isAutoConnectEnabled()) {
++                        android.util.Log.i("ObdService", "ACTION_AUTO_CONNECT received. Auto-connecting to saved adapter...")
++                        restoreLastDevice()
++                    }
+                 }
+             }
+         } catch (e: Exception) {
+@@ -367,7 +397,7 @@ class ObdService : Service() {
+                     discoverVehicleCapabilities()
+                     currentCoroutineContext().ensureActive()
+                     if (generation != connectionGeneration) return@launch
+-                    if (prefs().getBoolean(KEY_CSV_AUTOSTART, false)) startCsvLogging()
++                    if (csvAutostart()) startCsvLogging()
+                     startPollingLoop()
+                 } catch (e: CancellationException) {
+                     throw e
+@@ -865,7 +895,16 @@ class ObdService : Service() {
+         prefs().edit().putBoolean(KEY_CSV_AUTOSTART, enabled).apply()
+     }
+ 
+-    fun csvAutostart(): Boolean = prefs().getBoolean(KEY_CSV_AUTOSTART, false)
++    fun csvAutostart(): Boolean = prefs().getBoolean(KEY_CSV_AUTOSTART, true)
++
++    fun setAutoConnectEnabled(enabled: Boolean) {
++        prefs().edit().putBoolean(KEY_AUTOCONNECT, enabled).apply()
++        if (enabled && connectionState.value !is ConnectionState.Connected) {
++            restoreLastDevice()
++        }
++    }
++
++    fun isAutoConnectEnabled(): Boolean = prefs().getBoolean(KEY_AUTOCONNECT, true)
+ 
+     private suspend fun initializeElm327() {
+         try {
+@@ -1150,15 +1189,24 @@ class ObdService : Service() {
+             val generation = connectionGeneration
+             val link = transport
+             link.disconnect()
+-            while (isActive && activeDevice == target && generation == connectionGeneration && attempt < 5) {
++            while (isActive && activeDevice == target && generation == connectionGeneration) {
+                 attempt++
+-                val backoffSec = min(16, 1 shl min(4, attempt - 1))
+-                updateNotification("Reconnecting in ${backoffSec}s (Attempt $attempt)...")
++                val backoffSec = if (attempt <= 5) {
++                    min(16, 1 shl min(4, attempt - 1))
++                } else {
++                    // Car ignition is OFF. Keep persistent ignition watchdog poll every 6 seconds.
++                    6
++                }
++                if (attempt <= 5) {
++                    updateNotification("Reconnecting in ${backoffSec}s (Attempt $attempt)...")
++                } else {
++                    updateNotification("Waiting for car ignition (Auto-connect standby active)...")
++                }
+                 delay(backoffSec * 1000L)
+ 
+                 if (!isActive || activeDevice == null) break
+ 
+-                updateNotification("Reconnecting to ${BluetoothDeviceInfo.displayName(this@ObdService, target)}...")
++                updateNotification("Connecting to ${BluetoothDeviceInfo.displayName(this@ObdService, target)} on car ignition...")
+                 val ok = try {
+                     link.connect(target)
+                 } catch (e: CancellationException) {
+@@ -1177,6 +1225,10 @@ class ObdService : Service() {
+                         discoverVehicleCapabilities()
+                         currentCoroutineContext().ensureActive()
+                         if (generation != connectionGeneration) return@launch
++                        if (csvAutostart()) {
++                            startCsvLogging()
++                            android.util.Log.i("ObdService", "Car ignition connected: automatic CSV stream logging initiated.")
++                        }
+                         startPollingLoop()
+                         break
+                     } catch (e: CancellationException) { throw e }
+@@ -1186,9 +1238,6 @@ class ObdService : Service() {
+                     }
+                 }
+             }
+-            if (attempt >= 5 && connectionState.value !is ConnectionState.Connected) {
+-                stateRelay.publish(ConnectionState.Error("Adapter unavailable after 5 retries. Tap Connect to retry."))
+-            }
+         }
+     }
+ 
+@@ -1227,7 +1276,7 @@ class ObdService : Service() {
+      * successful connect. Silent no-op when Bluetooth is off, permission is missing, or the
+      * address is unknown.
+      */
+-    private fun restoreLastDevice() {
++    fun restoreLastDevice() {
+         if (activeDevice != null) return
+         val address = prefs().getString(KEY_LAST_DEVICE, null) ?: return
+         val ble = prefs().getBoolean(KEY_LAST_DEVICE_IS_BLE, false)
+@@ -1328,6 +1377,10 @@ class ObdService : Service() {
+     override fun onDestroy() {
+         super.onDestroy()
+         isRunning = false
++        try {
++            dynamicIgnitionReceiver?.let { unregisterReceiver(it) }
++        } catch (_: Exception) {}
++        dynamicIgnitionReceiver = null
+         stopPolling()
+         reconnectJob?.cancel()
+         connectJob?.cancel()
+diff --git a/android/app/src/main/java/com/sportage/obd/ui/CarLauncherScreen.kt b/android/app/src/main/java/com/sportage/obd/ui/CarLauncherScreen.kt
+index 8bce21d..3779886 100644
+--- a/android/app/src/main/java/com/sportage/obd/ui/CarLauncherScreen.kt
++++ b/android/app/src/main/java/com/sportage/obd/ui/CarLauncherScreen.kt
+@@ -1916,12 +1916,28 @@ fun SettingsPage(
+                     )
+                 }
+ 
++                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
++                    Column(Modifier.weight(1f).padding(end = 16.dp)) {
++                        Text("Auto-Connect On Car Ignition", color = PrimaryText(), fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.SansSerif)
++                        Text("Automatically pair and link when vehicle ignition powers on", color = SecondaryText(), fontSize = 12.sp, fontFamily = FontFamily.SansSerif)
++                    }
++                    var autoConnect by remember { mutableStateOf(viewModel?.isAutoConnectEnabled() ?: true) }
++                    Switch(
++                        checked = autoConnect,
++                        onCheckedChange = {
++                            autoConnect = it
++                            viewModel?.setAutoConnectEnabled(it)
++                        },
++                        colors = SwitchDefaults.colors(checkedThumbColor = TealAccent(), checkedTrackColor = TealAccent().copy(alpha = 0.4f))
++                    )
++                }
++
+                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                     Column(Modifier.weight(1f).padding(end = 16.dp)) {
+                         Text("Auto-Start With Connection", color = PrimaryText(), fontSize = 12.sp, fontWeight = FontWeight.Bold, fontFamily = FontFamily.SansSerif)
+-                        Text("Begin logging every time the adapter connects", color = SecondaryText(), fontSize = 12.sp, fontFamily = FontFamily.SansSerif)
++                        Text("Begin data stream logging every time the adapter connects", color = SecondaryText(), fontSize = 12.sp, fontFamily = FontFamily.SansSerif)
+                     }
+-                    var csvAuto by remember { mutableStateOf(viewModel?.csvAutostart() ?: false) }
++                    var csvAuto by remember { mutableStateOf(viewModel?.csvAutostart() ?: true) }
+                     Switch(
+                         checked = csvAuto,
+                         onCheckedChange = {
+diff --git a/android/app/src/main/java/com/sportage/obd/viewmodel/ObdViewModel.kt b/android/app/src/main/java/com/sportage/obd/viewmodel/ObdViewModel.kt
+index ccf8e5f..75fbac2 100644
+--- a/android/app/src/main/java/com/sportage/obd/viewmodel/ObdViewModel.kt
++++ b/android/app/src/main/java/com/sportage/obd/viewmodel/ObdViewModel.kt
+@@ -199,6 +199,12 @@ class ObdViewModel(application: Application) : AndroidViewModel(application) {
+ 
+     fun setCsvAutostart(enabled: Boolean) = repository.setCsvAutostart(enabled)
+ 
++    fun isAutoConnectEnabled(): Boolean = repository.isAutoConnectEnabled()
++
++    fun setAutoConnectEnabled(enabled: Boolean) = repository.setAutoConnectEnabled(enabled)
++
++    fun startAndBindService() = repository.startAndBindService()
++
+     suspend fun sendRawCommand(cmd: String): String {
+         return repository.sendRawCommand(cmd)
+     }
