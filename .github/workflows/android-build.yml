@@ -62,6 +62,75 @@ jobs:
           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > release.jks
           echo "Keystore restored ($(wc -c < release.jks) bytes)."
 
+      # ----------------------------------------------------------- google services
+      # Ensure google-services.json is present so the Google Services Gradle plugin can run.
+      # If repository secret GOOGLE_SERVICES_JSON is configured, use it; otherwise generate
+      # the valid dual-flavor (com.sportage.obd and com.sportage.obd.debug) placeholder.
+      - name: Ensure google-services.json
+        env:
+          GOOGLE_SERVICES_JSON_SECRET: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          if [ -n "$GOOGLE_SERVICES_JSON_SECRET" ]; then
+            echo "$GOOGLE_SERVICES_JSON_SECRET" > app/google-services.json
+            echo "Restored app/google-services.json from repository secret."
+          elif [ ! -f "app/google-services.json" ]; then
+            echo "app/google-services.json not found in repository. Generating build placeholder..."
+            mkdir -p app
+            cat << 'EOF' > app/google-services.json
+          {
+            "project_info": {
+              "project_number": "000000000000",
+              "project_id": "sportage-obd-placeholder",
+              "storage_bucket": "sportage-obd-placeholder.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "0:00000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.sportage.obd"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyPlaceholderKeyxxxxxxxxxxxxxxxxxxxxxx"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              },
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "0:00000000000:android:0000000000000000000000",
+                  "android_client_info": {
+                    "package_name": "com.sportage.obd.debug"
+                  }
+                },
+                "oauth_client": [],
+                "api_key": [
+                  {
+                    "current_key": "AIzaSyPlaceholderKeyxxxxxxxxxxxxxxxxxxxxxx"
+                  }
+                ],
+                "services": {
+                  "appinvite_service": {
+                    "other_platform_oauth_client": []
+                  }
+                }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          EOF
+            echo "Generated app/google-services.json successfully."
+          else
+            echo "app/google-services.json already present."
+          fi
+
       # ------------------------------------------------------------------ build
       - name: Unit tests
         run: ./gradlew testDebugUnitTest --stacktrace || true

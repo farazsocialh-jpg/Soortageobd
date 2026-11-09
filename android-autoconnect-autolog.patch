@@ -1,3 +1,21 @@
+From 4cd75ecc1d16122bcdd724faeecb2bc4f0ab5cc5 Mon Sep 17 00:00:00 2001
+From: Faraz Hassan Mirza <farazhassanmirza@gmail.com>
+Date: Sun, 8 Nov 2026 18:30:36 +0000
+Subject: [PATCH 1/2] Add car ignition Bluetooth auto-connect, automatic
+ telemetry stream logging, and fix GitHub Actions APK build workflow
+
+---
+ .github/workflows/android-build.yml           | 58 ++----------
+ android/app/src/main/AndroidManifest.xml      | 14 +++
+ .../java/com/sportage/obd/MainActivity.kt     |  6 ++
+ .../sportage/obd/repository/ObdRepository.kt  | 25 ++++-
+ .../sportage/obd/service/IgnitionReceiver.kt  | 93 +++++++++++++++++++
+ .../com/sportage/obd/service/ObdService.kt    | 81 +++++++++++++---
+ .../com/sportage/obd/ui/CarLauncherScreen.kt  | 20 +++-
+ .../sportage/obd/viewmodel/ObdViewModel.kt    |  6 ++
+ 8 files changed, 236 insertions(+), 67 deletions(-)
+ create mode 100644 android/app/src/main/java/com/sportage/obd/service/IgnitionReceiver.kt
+
 diff --git a/.github/workflows/android-build.yml b/.github/workflows/android-build.yml
 index 4233283..18921e2 100644
 --- a/.github/workflows/android-build.yml
@@ -523,3 +541,162 @@ index ccf8e5f..75fbac2 100644
      suspend fun sendRawCommand(cmd: String): String {
          return repository.sendRawCommand(cmd)
      }
+-- 
+2.34.1
+
+
+From 8235b5c03ed79fa1e57c2930b0cb46b92eb43891 Mon Sep 17 00:00:00 2001
+From: Faraz Hassan Mirza <farazhassanmirza@gmail.com>
+Date: Sun, 8 Nov 2026 18:37:46 +0000
+Subject: [PATCH 2/2] Fix CI build failure: ensure google-services.json and
+ conditional Firebase plugins
+
+---
+ .github/workflows/android-build.yml           | 69 +++++++++++++++++++
+ android/app/build.gradle.kts                  | 14 +++-
+ .../java/com/sportage/obd/SportageObdApp.kt   | 10 ++-
+ 3 files changed, 88 insertions(+), 5 deletions(-)
+
+diff --git a/.github/workflows/android-build.yml b/.github/workflows/android-build.yml
+index 18921e2..c346582 100644
+--- a/.github/workflows/android-build.yml
++++ b/.github/workflows/android-build.yml
+@@ -62,6 +62,75 @@ jobs:
+           printf '%s' "$RELEASE_KEYSTORE_BASE64" | base64 --decode > release.jks
+           echo "Keystore restored ($(wc -c < release.jks) bytes)."
+ 
++      # ----------------------------------------------------------- google services
++      # Ensure google-services.json is present so the Google Services Gradle plugin can run.
++      # If repository secret GOOGLE_SERVICES_JSON is configured, use it; otherwise generate
++      # the valid dual-flavor (com.sportage.obd and com.sportage.obd.debug) placeholder.
++      - name: Ensure google-services.json
++        env:
++          GOOGLE_SERVICES_JSON_SECRET: ${{ secrets.GOOGLE_SERVICES_JSON }}
++        run: |
++          if [ -n "$GOOGLE_SERVICES_JSON_SECRET" ]; then
++            echo "$GOOGLE_SERVICES_JSON_SECRET" > app/google-services.json
++            echo "Restored app/google-services.json from repository secret."
++          elif [ ! -f "app/google-services.json" ]; then
++            echo "app/google-services.json not found in repository. Generating build placeholder..."
++            mkdir -p app
++            cat << 'EOF' > app/google-services.json
++          {
++            "project_info": {
++              "project_number": "000000000000",
++              "project_id": "sportage-obd-placeholder",
++              "storage_bucket": "sportage-obd-placeholder.appspot.com"
++            },
++            "client": [
++              {
++                "client_info": {
++                  "mobilesdk_app_id": "0:00000000000:android:0000000000000000000000",
++                  "android_client_info": {
++                    "package_name": "com.sportage.obd"
++                  }
++                },
++                "oauth_client": [],
++                "api_key": [
++                  {
++                    "current_key": "AIzaSyPlaceholderKeyxxxxxxxxxxxxxxxxxxxxxx"
++                  }
++                ],
++                "services": {
++                  "appinvite_service": {
++                    "other_platform_oauth_client": []
++                  }
++                }
++              },
++              {
++                "client_info": {
++                  "mobilesdk_app_id": "0:00000000000:android:0000000000000000000000",
++                  "android_client_info": {
++                    "package_name": "com.sportage.obd.debug"
++                  }
++                },
++                "oauth_client": [],
++                "api_key": [
++                  {
++                    "current_key": "AIzaSyPlaceholderKeyxxxxxxxxxxxxxxxxxxxxxx"
++                  }
++                ],
++                "services": {
++                  "appinvite_service": {
++                    "other_platform_oauth_client": []
++                  }
++                }
++              }
++            ],
++            "configuration_version": "1"
++          }
++          EOF
++            echo "Generated app/google-services.json successfully."
++          else
++            echo "app/google-services.json already present."
++          fi
++
+       # ------------------------------------------------------------------ build
+       - name: Unit tests
+         run: ./gradlew testDebugUnitTest --stacktrace || true
+diff --git a/android/app/build.gradle.kts b/android/app/build.gradle.kts
+index c6f6ea9..25a4605 100644
+--- a/android/app/build.gradle.kts
++++ b/android/app/build.gradle.kts
+@@ -6,8 +6,18 @@ plugins {
+     alias(libs.plugins.kotlin.compose)
+     // Firebase plugins: apply only when google-services.json is present.
+     // The google-services plugin must come before crashlytics.
+-    alias(libs.plugins.google.services)
+-    alias(libs.plugins.firebase.crashlytics)
++    alias(libs.plugins.google.services) apply false
++    alias(libs.plugins.firebase.crashlytics) apply false
++}
++
++// Conditionally apply Google Services and Crashlytics only when google-services.json exists
++val hasGoogleServices = file("google-services.json").exists() ||
++    file("src/release/google-services.json").exists() ||
++    file("src/debug/google-services.json").exists()
++
++if (hasGoogleServices) {
++    apply(plugin = "com.google.gms.google-services")
++    apply(plugin = "com.google.firebase.crashlytics")
+ }
+ 
+ android {
+diff --git a/android/app/src/main/java/com/sportage/obd/SportageObdApp.kt b/android/app/src/main/java/com/sportage/obd/SportageObdApp.kt
+index 0caf16e..85452c0 100644
+--- a/android/app/src/main/java/com/sportage/obd/SportageObdApp.kt
++++ b/android/app/src/main/java/com/sportage/obd/SportageObdApp.kt
+@@ -24,7 +24,7 @@ import java.util.Locale
+  */
+ class SportageObdApp : Application() {
+ 
+-    lateinit var firebaseAnalytics: FirebaseAnalytics
++    var firebaseAnalytics: FirebaseAnalytics? = null
+         private set
+ 
+     override fun onCreate() {
+@@ -33,7 +33,11 @@ class SportageObdApp : Application() {
+ 
+         // Initialize Firebase Analytics (always-on, anonymous usage tracking).
+         // If google-services.json is missing, Firebase is inactive but the app still runs.
+-        firebaseAnalytics = FirebaseAnalytics.getInstance(this)
++        try {
++            firebaseAnalytics = FirebaseAnalytics.getInstance(this)
++        } catch (e: Exception) {
++            Log.w("SportageObdApp", "Firebase Analytics initialization skipped: ${e.message}")
++        }
+ 
+         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
+         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
+@@ -63,7 +67,7 @@ class SportageObdApp : Application() {
+ 
+                 // Log key context for analytics (best-effort, no user-identifying data).
+                 try {
+-                    firebaseAnalytics.logEvent("app_crash", bundleOf(
++                    firebaseAnalytics?.logEvent("app_crash", bundleOf(
+                         "exception_class" to (throwable.javaClass.name.take(100)),
+                         "has_previous_crash_file" to File(filesDir, "last_crash.txt").exists()
+                     ))
+-- 
+2.34.1
+

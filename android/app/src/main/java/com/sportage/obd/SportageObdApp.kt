@@ -24,7 +24,7 @@ import java.util.Locale
  */
 class SportageObdApp : Application() {
 
-    lateinit var firebaseAnalytics: FirebaseAnalytics
+    var firebaseAnalytics: FirebaseAnalytics? = null
         private set
 
     override fun onCreate() {
@@ -33,7 +33,11 @@ class SportageObdApp : Application() {
 
         // Initialize Firebase Analytics (always-on, anonymous usage tracking).
         // If google-services.json is missing, Firebase is inactive but the app still runs.
-        firebaseAnalytics = FirebaseAnalytics.getInstance(this)
+        try {
+            firebaseAnalytics = FirebaseAnalytics.getInstance(this)
+        } catch (e: Exception) {
+            Log.w("SportageObdApp", "Firebase Analytics initialization skipped: ${e.message}")
+        }
 
         val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -63,7 +67,7 @@ class SportageObdApp : Application() {
 
                 // Log key context for analytics (best-effort, no user-identifying data).
                 try {
-                    firebaseAnalytics.logEvent("app_crash", bundleOf(
+                    firebaseAnalytics?.logEvent("app_crash", bundleOf(
                         "exception_class" to (throwable.javaClass.name.take(100)),
                         "has_previous_crash_file" to File(filesDir, "last_crash.txt").exists()
                     ))

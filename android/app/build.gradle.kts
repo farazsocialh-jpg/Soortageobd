@@ -6,8 +6,18 @@ plugins {
     alias(libs.plugins.kotlin.compose)
     // Firebase plugins: apply only when google-services.json is present.
     // The google-services plugin must come before crashlytics.
-    alias(libs.plugins.google.services)
-    alias(libs.plugins.firebase.crashlytics)
+    alias(libs.plugins.google.services) apply false
+    alias(libs.plugins.firebase.crashlytics) apply false
+}
+
+// Conditionally apply Google Services and Crashlytics only when google-services.json exists
+val hasGoogleServices = file("google-services.json").exists() ||
+    file("src/release/google-services.json").exists() ||
+    file("src/debug/google-services.json").exists()
+
+if (hasGoogleServices) {
+    apply(plugin = "com.google.gms.google-services")
+    apply(plugin = "com.google.firebase.crashlytics")
 }
 
 android {
